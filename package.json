@@ -1,0 +1,26 @@
+{
+  "name": "sentinel-security-adst",
+  "version": "1.0.0",
+  "description": "Sentinel: Application Security Code Sandbox & Attack Simulation Tree",
+  "main": "backend/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node backend/server.js",
+    "dev": "node backend/server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "security",
+    "appsec",
+    "vulnerability",
+    "training",
+    "sandbox"
+  ],
+  "author": "Sentinel Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3"
+  }
+}
