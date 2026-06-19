@@ -1,0 +1,6 @@
+{
+  "name": "Sentinel Real-Time Code Analyzer",
+  "description": "A functional static application security testing (SAST) tool that scans code for Open Redirect, IDOR, and Parameter Tampering, providing remediation guidance and attack path maps built on the Gemini API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
