@@ -1,138 +1,127 @@
+#!/usr/bin/env python3
 import os
 import sys
 import re
-
-print("==========================================================================")
-print(" Sentinel™ Real-Time CLI Code Analyzer Init Check")
-print("==========================================================================")
-
-class RichMock:
-    class Console:
-        def print(self, *args, **kwargs):
-            import builtins
-            builtins.print(*args, **kwargs)
-
-try:
-    from rich.console import Console
-    from rich.tree import Tree
-    from rich import print as rprint
-except ImportError:
-    # Handle environment where Rich library is not immediately available natively on client
-    # fallback elegantly to simple formatted terminal trees
-    class Tree:
-        def __init__(self, label):
-            self.label = label
-            self.children = []
-        def add(self, label):
-            node = Tree(label)
-            self.children.append(node)
-            return node
-    
-    def rprint(text):
-        print(text)
-    
-    Console = RichMock.Console
+import argparse
+from rich.console import Console
+from rich.tree import Tree
+from rich.table import Table
+from rich.panel import Panel
 
 console = Console()
 
-def run_local_heuristics(filepath):
-    issues = []
-    try:
-        with open(filepath, 'r', errors='ignore') as f:
-            lines = f.readlines()
-        
+class SentinelScanner:
+    def __init__(self):
+        # Advanced Regex Patterns
+        self.rules = [
+            {
+                "id": "CWE-601",
+                "type": "Open Redirect",
+                "severity": "HIGH",
+                # Matches redirects using request inputs without validation
+                "pattern": r"(?:res\.redirect|window\.location|location\.href|window\.open)\s*\(\s*(?:req\.(?:query|params|body)|url|target|dest|to|path|redirect_uri).*?\)",
+                "negative_lookahead": r"whitelist|safe|isValid|validateUrl|checkOrigin",
+                "description": "Unvalidated user-controlled input is used as a redirection target.",
+                "remediation": "Implement an allow-list of approved URLs or use relative paths only."
+            },
+            {
+                "id": "CWE-639",
+                "type": "IDOR (Insecure Direct Object Reference)",
+                "severity": "CRITICAL",
+                # Matches DB lookups using request IDs without session context
+                "pattern": r"(?:findById|select|db\.query|findOne|collection\(.*?\)\.doc)\s*\(\s*(?:req\.(?:params|query|body)\.(?:id|uid|user_id|uuid)).*?\)",
+                "negative_lookahead": r"req\.user|session|owner|tenant|auth|permission",
+                "description": "Sensitive resource accessed via user-controlled ID without ownership verification.",
+                "remediation": "Validate that the authenticated user has permission to access the requested resource ID."
+            },
+            {
+                "id": "CWE-639", # Corrected from CWE-434 to CWE-639 (Insecure Direct Object Reference / IDOR) or CWE-472
+                "type": "Parameter Tampering",
+                "severity": "HIGH",
+                # Matches critical fields being assigned directly from request
+                "pattern": r"(?:price|amount|quantity|role|admin|permission|is_admin|status)\s*=\s*req\.(?:body|query|params)\.(?:price|amount|quantity|role|admin|permission|is_admin|status)",
+                "negative_lookahead": r"verifyPrice|db\.lookup|config\.get|calculate|validate",
+                "description": "Critical business logic parameters are accepted directly from client-side requests.",
+                "remediation": "Retrieve critical values (like prices or roles) from a trusted server-side source or database."
+            }
+        ]
+
+    def scan_content(self, content):
+        issues = []
+        lines = content.splitlines()
         for idx, line in enumerate(lines):
             line_num = idx + 1
-            lt = line.strip()
-            
-            # Open Redirect detection
-            if ("redirect" in lt or "window.location" in lt or "location.href" in lt) and \
-               ("query" in lt or "params" in lt or "url" in lt or "target" in lt) and \
-               not any(w in lt for w in ["whitelist", "safe", "isValid"]):
-                issues.append({
-                    "type": "Open Redirect",
-                    "severity": "[bold red]HIGH[/bold red]",
-                    "line": line_num,
-                    "snippet": lt,
-                    "desc": "Unvalidated redirect target using request values"
-                })
-                
-            # IDOR detection
-            if any(k in lt for k in ["findById", "select", "db.query", "findOne"]) and \
-               any(p in lt for p in ["params.id", "query.id", "body.id"]) and \
-               not any(s in lt for s in ["session", "owner", "tenant", "req.user"]):
-                issues.append({
-                    "type": "IDOR",
-                    "severity": "[bold red]CRITICAL[/bold red]",
-                    "line": line_num,
-                    "snippet": lt,
-                    "desc": "Critical Direct database lookup with dynamic input parameter without current user checks"
-                })
-                
-            # Parameter Tampering detection
-            if any(p in lt for p in ["price", "amount", "quantity", "role", "admin"]) and \
-               any(r in lt for r in ["req.body", "req.query", "req.params"]) and \
-               not any(v in lt for v in ["verifyPrice", "db."]):
-                issues.append({
-                    "type": "Parameter Tampering",
-                    "severity": "[bold yellow]MEDIUM[/bold yellow]",
-                    "line": line_num,
-                    "snippet": lt,
-                    "desc": "Critical parameter states (role/payment values) mapped straight from query variables"
-                })
-    except Exception as e:
-        rprint(f"[red]Error analyzing {filepath}: {str(e)}[/red]")
-    return issues
+            for rule in self.rules:
+                if re.search(rule["pattern"], line):
+                    # Check for security controls (negative lookahead)
+                    if not re.search(rule["negative_lookahead"], line, re.IGNORECASE):
+                        issues.append({
+                            "cwe": rule["id"],
+                            "type": rule["type"],
+                            "severity": rule["severity"],
+                            "line": line_num,
+                            "snippet": line.strip(),
+                            "description": rule["description"],
+                            "remediation": rule["remediation"]
+                        })
+        return issues
 
-def scan_directory(path_target):
-    rprint(f"\n[bold cyan]Starting Sentinel™ Fast Scan for: {path_target}[/bold cyan]")
-    if not os.path.exists(path_target):
-        rprint("[bold red]Error: Path target does not exist.[/bold red]")
-        return
+    def scan_file(self, filepath):
+        if not os.path.isfile(filepath):
+            console.print(f"[bold red]Error:[/bold red] File not found: {filepath}")
+            return None
         
-    all_issues = {}
-    if os.path.isfile(path_target):
-        issues = run_local_heuristics(path_target)
-        if issues:
-            all_issues[path_target] = issues
-    else:
-        for root, dirs, files in os.walk(path_target):
-            # Skip noise folders
-            if any(exclude in root for exclude in ["node_modules", ".git", "dist", "env", "venv"]):
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            return self.scan_content(content)
+        except Exception as e:
+            console.print(f"[bold red]Error reading {filepath}:[/bold red] {str(e)}")
+            return None
+
+    def scan_directory(self, dirpath):
+        results = {}
+        for root, _, files in os.walk(dirpath):
+            if any(x in root for x in ["node_modules", ".git", "dist", "venv", "__pycache__"]):
                 continue
             for file in files:
-                if file.endswith(('.ts', '.js', '.tsx', '.jsx', '.py', '.rb', '.go', '.java')):
-                    fullpath = os.path.join(root, file)
-                    issues = run_local_heuristics(fullpath)
+                if file.endswith(('.ts', '.js', '.tsx', '.jsx', '.py')):
+                    path = os.path.join(root, file)
+                    issues = self.scan_file(path)
                     if issues:
-                        all_issues[fullpath] = issues
+                        results[path] = issues
+        return results
 
-    if not all_issues:
-        rprint("[bold green]✔ Scan complete. Sentinel™ detected 0 fast-heuristic code threats![/bold green]\n")
+def main():
+    parser = argparse.ArgumentParser(description="Sentinel™ Real-Time Code Analyzer CLI")
+    parser.add_argument("target", nargs="?", default=".", help="File or directory to scan (default: current directory)")
+    args = parser.parse_args()
+
+    scanner = SentinelScanner()
+    target = args.target
+
+    console.print(Panel.fit("[bold cyan]Sentinel™ Security Engine v2.5[/bold cyan]\n[dim]Advanced Regex-Based Static Analysis[/dim]", border_style="blue"))
+
+    if os.path.isfile(target):
+        issues = scanner.scan_file(target)
+        all_results = {target: issues} if issues else {}
+    else:
+        all_results = scanner.scan_directory(target)
+
+    if not all_results:
+        console.print("[bold green]✔ No vulnerabilities detected by heuristic engine.[/bold green]")
         return
 
-    rprint(f"[bold red]Found vulnerabilities across {len(all_issues)} file(s). Rendering ADST Security Trees:[/bold red]\n")
-    
-    for filepath, issues in all_issues.items():
-        tree = Tree(f"[bold white]{os.path.basename(filepath)}[/bold white] ({len(issues)} flaws)")
+    for path, issues in all_results.items():
+        tree = Tree(f"[bold white]{path}[/bold white] [red]({len(issues)} issues found)[/red]")
         for iss in issues:
-            child = tree.add(f"[{iss['severity']}] {iss['type']} at Line {iss['line']}")
-            child.add(f"Snippet: [dim]{iss['snippet'][:60]}[/dim]")
-            child.add(f"Flaw explanation: {iss['desc']}")
-        
-        # Rendering
-        if hasattr(tree, 'children') and not isinstance(Console(), RichMock.Console):
-            # If using actual Tree print class
-            console.print(tree)
-        else:
-            # Elegant text-fallback tree representation manually
-            print(f"└── {tree.label}")
-            for node in tree.children:
-                print(f"    ├── {node.label}")
-                for sub in node.children:
-                    print(f"    │   └── {sub.label}")
-        print("-" * 50)
+            severity_color = "red" if iss["severity"] in ["CRITICAL", "HIGH"] else "yellow"
+            node = tree.add(f"[{severity_color}]{iss['severity']}[/{severity_color}] [bold]{iss['type']}[/bold] ([dim]{iss['cwe']}[/dim]) at Line {iss['line']}")
+            node.add(f"Snippet: [italic]{iss['snippet'][:100]}[/italic]")
+            node.add(f"Description: {iss['description']}")
+            node.add(f"Remediation: [green]{iss['remediation']}[/green]")
+        console.print(tree)
+        console.print("-" * 80)
 
 if __name__ == "__main__":
-    target = "." if len(sys.argv) < 2 else sys.argv[1]
-    scan_directory(target)
+    main()
