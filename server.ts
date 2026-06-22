@@ -12,7 +12,7 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// --- Tactical Detection Engine (Hardened) ---
+// --- Ironclad Data-Flow Engine ---
 
 interface Issue {
   id: string;
@@ -31,74 +31,104 @@ const CWE_MAP = {
   PARAM_TAMPERING: "CWE-472"
 };
 
-const TAMPER_KEYS = ["price", "amount", "amt", "quantity", "qty", "role", "admin", "is_admin", "permission", "status"];
+const TAMPER_KEYS = ["cost", "unitcost", "fee", "discount", "balance", "total", "price", "amt", "quantity", "qty", "role", "admin"];
+const TRUST_PATTERNS = [/db\.lookup/i, /await\s+db\./i, /config\.get/i, /fetchfromdatabase/i, /getpricefromdb/i];
 
-function runTacticalScan(code: string): Issue[] {
+function runIroncladScan(code: string): Issue[] {
   const issues: Issue[] = [];
-  const lines = code.split("\n");
+  const rawLines = code.split("\n");
+  const cleanLines = rawLines.map(l => l.replace(/\/\/.*$|\/\*.*?\*\//g, ""));
   
-  // 1. Extract Variables (Tracking Sources)
-  const varsFound = {
-    redirect: new Set<string>(),
-    id: new Set<string>(),
-    tamper: new Set<string>()
+  const taintedVars: Record<string, Set<string>> = {
+    redirect: new Set(),
+    id: new Set(),
+    tamper: new Set()
   };
+  const secureVars = new Set<string>();
 
-  // Standard Assignment Tracking
-  const stdRegex = /(?:const|let|var)\s+(\w+)\s*=\s*req\.(?:query|params|body)\.(\w+)/g;
-  let match;
-  while ((match = stdRegex.exec(code)) !== null) {
-    const [_, varName, sourceKey] = match;
-    categorizeVar(varName, sourceKey, varsFound);
-  }
+  // 1. Initial Taint Sources
+  cleanLines.forEach(line => {
+    const stdMatch = line.match(/(?:const|let|var)\s+(\w+)\s*=\s*req\.(?:query|params|body)\.(\w+)/);
+    if (stdMatch) {
+      const [_, varName, sourceKey] = stdMatch;
+      categorizeVar(varName, sourceKey, taintedVars);
+    }
 
-  // ES6 Destructuring Tracking
-  const destructRegex = /(?:const|let|var)\s*\{\s*([^}]+)\s*\}\s*=\s*req\.(?:query|params|body)/g;
-  while ((match = destructRegex.exec(code)) !== null) {
-    const items = match[1].split(",").map(i => i.trim().split(":")[0].trim());
-    items.forEach(item => categorizeVar(item, item, varsFound));
-  }
+    const destructMatch = line.match(/(?:const|let|var)\s*\{\s*([^}]+)\s*\}\s*=\s*req\.(?:query|params|body)/);
+    if (destructMatch) {
+      destructMatch[1].split(",").forEach(item => {
+        const [src, local] = item.includes(":") ? item.split(":").map(i => i.trim()) : [item.trim(), item.trim()];
+        categorizeVar(local, src, taintedVars);
+      });
+    }
+
+    TRUST_PATTERNS.forEach(pattern => {
+      const trustMatch = line.match(new RegExp(`(?:const|let|var)\\s+(\\w+)\\s*=\\s*.*?${pattern.source}`, "i"));
+      if (trustMatch) secureVars.add(trustMatch[1]);
+    });
+  });
 
   function categorizeVar(name: string, key: string, map: any) {
     const sk = key.toLowerCase();
-    if (["url", "target", "dest", "to", "path", "redirect"].some(k => sk.includes(k))) map.redirect.add(name);
-    if (["id", "uid", "uuid", "user_id"].some(k => sk.includes(k))) map.id.add(name);
-    if (TAMPER_KEYS.some(k => sk.includes(k))) map.tamper.add(name);
+    const vn = name.toLowerCase();
+    if (["url", "target", "dest", "to", "path", "redirect"].some(k => sk.includes(k) || vn.includes(k))) map.redirect.add(name);
+    if (["id", "uid", "uuid", "user_id", "invoiceid"].some(k => sk.includes(k) || vn.includes(k))) map.id.add(name);
+    if (TAMPER_KEYS.some(k => sk.includes(k) || vn.includes(k))) map.tamper.add(name);
   }
 
-  // 2. Scan for Sinks with Contextual Lookback
-  lines.forEach((line, index) => {
+  // 2. Transitive Propagation
+  let changed = true;
+  while (changed) {
+    changed = false;
+    cleanLines.forEach(line => {
+      const assignMatch = line.match(/(?:const|let|var|)\s*(\w+)\s*=\s*(\w+)(?:\s*;|\s*$)/);
+      if (assignMatch) {
+        const [_, target, source] = assignMatch;
+        if (secureVars.has(source) && !secureVars.has(target)) {
+          secureVars.add(target);
+          changed = true;
+        }
+        Object.keys(taintedVars).forEach(cat => {
+          if (taintedVars[cat].has(source) && !taintedVars[cat].has(target) && !secureVars.has(target)) {
+            taintedVars[cat].add(target);
+            changed = true;
+          }
+        });
+      }
+    });
+  }
+
+  // 3. Sink Detection
+  cleanLines.forEach((line, index) => {
     const lineNum = index + 1;
-    const context = lines.slice(Math.max(0, index - 5), index).join("\n").toLowerCase();
+    const context = cleanLines.slice(Math.max(0, index - 5), index).join("\n").toLowerCase();
     const fullContext = (context + "\n" + line).toLowerCase();
     
-    const isValidated = (v: string, auth = false) => {
-      const patterns = ["whitelist", "isvalid", "safe", "validate", "check", "includes", "indexof", "allowed", "verify", "auth", "permission"];
-      if (auth) patterns.push(...["req.user", "session", "owner", "tenant", "db.user"]);
-      return patterns.some(p => fullContext.includes(p));
+    const isValidated = (auth = false) => {
+      const patterns = [/\bwhitelist\b/, /\bisvalid\b/, /\bsafe\b/, /\bvalidate\b/, /\bcheck\b/, /\bincludes\b/, /\bindexof\b/, /\ballowed\b/, /\bverify\b/, /\bauth\b/, /\bpermission\b/];
+      if (auth) patterns.push(...[/\breq\.user\b/, /\bsession\b/, /\bowner\b/, /\btenant\b/, /\bdb\.user\b/]);
+      return patterns.some(p => p.test(fullContext));
     };
 
-    // Open Redirect (CWE-601)
-    varsFound.redirect.forEach(v => {
-      const sinkRegex = new RegExp(`(?:res\\.redirect|window\\.location|location\\.href|window\\.open)\\s*\\(.*?${v}.*?\\)`);
-      if (sinkRegex.test(line) && !isValidated(v)) {
-        issues.push(createIssue("OPEN_REDIRECT", "Open Redirect", "HIGH", lineNum, line, `Unvalidated variable '${v}' used in redirection.`));
+    taintedVars.redirect.forEach(v => {
+      if (secureVars.has(v)) return;
+      if (new RegExp(`(?:res\\.redirect|window\\.location|location\\.href|window\\.open)\\s*\\(.*?\\b${v}\\b`).test(line) && !isValidated()) {
+        issues.push(createIssue("OPEN_REDIRECT", "Open Redirect", "HIGH", lineNum, rawLines[index], `Tainted variable '${v}' used in redirect.`));
       }
     });
 
-    // IDOR (CWE-639)
-    varsFound.id.forEach(v => {
-      const sinkRegex = new RegExp(`(?:findById|select|db\\.query|findOne|collection\\(.*?\\)\\.doc|db\\..*?\\(.*?\\))\\s*\\(.*?${v}.*?\\)`);
-      if (sinkRegex.test(line) && !isValidated(v, true)) {
-        issues.push(createIssue("IDOR", "IDOR / Access Control Bypass", "CRITICAL", lineNum, line, `DB query using ID '${v}' without ownership check.`));
+    taintedVars.id.forEach(v => {
+      if (secureVars.has(v)) return;
+      if (new RegExp(`(?:findById|select|db\\.query|findOne|collection\\(.*?\\)\\.doc|db\\.\\w+)\\s*\\(.*?\\b${v}\\b`).test(line) && !isValidated(true)) {
+        issues.push(createIssue("IDOR", "IDOR / Access Control Bypass", "CRITICAL", lineNum, rawLines[index], `Tainted ID '${v}' used in DB query.`));
       }
     });
 
-    // Parameter Tampering (CWE-472)
-    varsFound.tamper.forEach(v => {
-      const sinkRegex = new RegExp(`(?:price|amount|role|admin|status|permission)\\s*=\\s*.*?${v}`);
-      if (sinkRegex.test(line) && !isValidated(v)) {
-        issues.push(createIssue("PARAM_TAMPERING", "Parameter Tampering", "HIGH", lineNum, line, `Critical field assigned from user-controlled variable '${v}'.`));
+    taintedVars.tamper.forEach(v => {
+      if (secureVars.has(v)) return;
+      const tamperPattern = new RegExp(`\\b(?:${TAMPER_KEYS.join("|")})\\b\\s*[:=]\\s*.*?\\b${v}\\b`, "i");
+      if (tamperPattern.test(line) && !isValidated()) {
+        issues.push(createIssue("PARAM_TAMPERING", "Parameter Tampering", "HIGH", lineNum, rawLines[index], `Critical field assigned from tainted variable '${v}'.`));
       }
     });
   });
@@ -108,9 +138,9 @@ function runTacticalScan(code: string): Issue[] {
 
 function createIssue(typeKey: string, typeName: string, severity: any, line: number, snippet: string, desc: string): Issue {
   const remediations: any = {
-    OPEN_REDIRECT: "Use an allow-list of safe domains or relative paths.",
-    IDOR: "Verify resource ownership against req.user.id before DB access.",
-    PARAM_TAMPERING: "Retrieve authoritative values (price/role) from server-side database."
+    OPEN_REDIRECT: "Use allow-list.",
+    IDOR: "Check ownership.",
+    PARAM_TAMPERING: "Fetch authoritative values from server-side database."
   };
   return {
     id: `${CWE_MAP[typeKey as keyof typeof CWE_MAP]}-${line}`,
@@ -129,25 +159,25 @@ function createIssue(typeKey: string, typeName: string, severity: any, line: num
 app.post("/api/scan", (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ error: "No code provided" });
-  const issues = runTacticalScan(code);
+  const issues = runIroncladScan(code);
   res.json({ success: true, issues });
 });
 
 app.post("/api/scan-deep", async (req, res) => {
   const { code } = req.body;
   if (!code) return res.status(400).json({ error: "No code provided" });
-  const localIssues = runTacticalScan(code);
+  const localIssues = runIroncladScan(code);
   const key = process.env.GEMINI_API_KEY;
 
   if (!key) {
     return res.json({
       success: true,
       analysis: {
-        summary: "Tactical heuristic scan complete. Deep AI Audit requires API Key.",
+        summary: "Ironclad heuristic scan complete.",
         issues: localIssues,
         adst: {
-          nodeName: "Tactical Analysis Root",
-          description: "Variable tracking and contextual analysis results",
+          nodeName: "Data-Flow Analysis Root",
+          description: "Multi-hop taint tracking results",
           children: localIssues.map(i => ({ nodeName: i.type, description: i.description }))
         }
       }
@@ -157,8 +187,7 @@ app.post("/api/scan-deep", async (req, res) => {
   try {
     const genAI = new GoogleGenAI(key);
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const prompt = `Perform a military-grade security audit. Return JSON only.
-    Schema: { "summary": string, "issues": Issue[], "remediationPatch": string, "adst": Node }
+    const prompt = `Perform a deep security audit. Return JSON only.
     Code:
     ${code}`;
     const result = await model.generateContent(prompt);
